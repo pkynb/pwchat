@@ -321,7 +321,6 @@
     </div>
   </main>
 
-  <script src="paho-mqtt.js"></script>
   <script>
     (function () {
       const $ = (id) => document.getElementById(id);
@@ -330,9 +329,8 @@
       const DB_NAME = "twoPersonChatDB";
       const DB_VERSION = 1;
       const MAX_FILE_BYTES = 30 * 1024 * 1024;
-      const MQTT_HOST = "broker.hivemq.com";
-      const MQTT_PORT = 8884;
-      const MQTT_TOPIC = "pwchat/github-pkynb";
+      const NTFY_BASE = "https://ntfy.sh";
+      const NTFY_TOPIC = "pwchat-github-pkynb";
 
       // 题目和答案集中在这里，改这一块即可。
       const QUESTIONS = [
@@ -378,12 +376,11 @@
       let currentQuizQuestions = [];
       let messages = [];
       let seen = new Set();
+      let serverIds = new Set();
       let selectedFile = null;
       let dbPromise = null;
-      let mqttClient = null;
-      let mqttConnected = false;
-      let mqttClientId = "";
-      let helloTimer = null;
+      let ntfySocket = null;
+      let ntfyConnected = false;
 
       function openDatabase() {
         if (dbPromise) return dbPromise;
@@ -654,86 +651,73 @@
         return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
       }
 
-      function publishHello() {
-        if (!mqttConnected || !mqttClient) return;
-        const payload = {
-          type: "hello",
-          clientId: mqttClientId,
-          ids: messages.map((message) => message.id)
-        };
-        mqttClient.publish(MQTT_TOPIC, JSON.stringify(payload), { qos: 0 });
-      }
-
-      function publishMissing(peerIds) {
-        if (!mqttConnected || !mqttClient) return;
-        const missing = messages.filter((message) => !peerIds.has(message.id));
-        if (missing.length === 0) return;
-        const payload = { type: "sync", messages: missing };
-        mqttClient.publish(MQTT_TOPIC, JSON.stringify(payload), { qos: 0 });
-      }
-
-      function handleRemoteMessage(rawPayload) {
+      function handleRemotePayload(rawMessage) {
         let data;
         try {
-          data = JSON.parse(rawPayload);
+          data = JSON.parse(rawMessage);
         } catch {
           return;
         }
-        if (!data || typeof data !== "object") return;
+        if (!data || data.type !== "message" || !data.message) return;
+        const message = data.message;
+        if (message && message.id) {
+          serverIds.add(message.id);
+        }
+        mergeMessages([message]);
+      }
 
-        if (data.type === "hello") {
-          if (data.clientId === mqttClientId) return;
-          const peerIds = new Set(Array.isArray(data.ids) ? data.ids : []);
-          publishMissing(peerIds);
-        } else if (data.type === "sync") {
-          mergeMessages(Array.isArray(data.messages) ? data.messages : []);
-        } else if (data.type === "message" && data.message) {
-          mergeMessages([data.message]);
+      async function publishPayload(payload) {
+        const response = await fetch(`${NTFY_BASE}/${NTFY_TOPIC}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        });
+        if (!response.ok) {
+          throw new Error("publish failed");
+        }
+        return response.json();
+      }
+
+      function syncLocalHistory() {
+        const missing = messages.filter((message) => !serverIds.has(message.id));
+        for (const message of missing) {
+          const outgoing = { ...message };
+          delete outgoing.mediaData;
+          publishPayload({ type: "message", message: outgoing })
+            .then(() => serverIds.add(message.id))
+            .catch(() => {});
         }
       }
 
-      function connectMqtt() {
-        if (!window.Paho || mqttClient) return;
+      function connectNtfy() {
+        if (ntfySocket) return;
 
-        mqttClientId = `pwchat-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
-        mqttClient = new Paho.Client(MQTT_HOST, MQTT_PORT, mqttClientId);
+        const socket = new WebSocket(`wss://ntfy.sh/${NTFY_TOPIC}/ws?since=all`);
+        ntfySocket = socket;
 
-        mqttClient.onConnectionLost = () => {
-          mqttConnected = false;
-          setStatus(false);
-          setTimeout(() => {
-            mqttClient = null;
-            connectMqtt();
-          }, 5000);
+        socket.onopen = () => {
+          ntfyConnected = true;
+          setStatus(true);
+          setTimeout(syncLocalHistory, 1500);
         };
 
-        mqttClient.onMessageArrived = (message) => {
-          handleRemoteMessage(message.payloadString);
-        };
-
-        mqttClient.connect({
-          useSSL: true,
-          timeout: 10,
-          keepAliveInterval: 30,
-          cleanSession: true,
-          onSuccess: () => {
-            mqttConnected = true;
-            mqttClient.subscribe(MQTT_TOPIC, { qos: 0 });
-            setStatus(true);
-            setTimeout(publishHello, 500);
-            if (!helloTimer) {
-              helloTimer = setInterval(publishHello, 15000);
+        socket.onmessage = (event) => {
+          try {
+            const data = JSON.parse(event.data);
+            if (data && data.event === "message" && data.message) {
+              handleRemotePayload(data.message);
             }
-          },
-          onFailure: () => {
-            mqttConnected = false;
-            setStatus(false);
-            setTimeout(() => {
-              mqttClient = null;
-              connectMqtt();
-            }, 5000);
-          }
-        });
+          } catch {}
+        };
+
+        socket.onerror = () => setStatus(false);
+
+        socket.onclose = () => {
+          ntfyConnected = false;
+          setStatus(false);
+          ntfySocket = null;
+          setTimeout(connectNtfy, 5000);
+        };
       }
 
       function importLegacyHistory() {
@@ -777,7 +761,22 @@
         showAttachment(`${kind}：${file.name}（${formatBytes(file.size)}）`);
       }
 
-      function sendMessage() {
+      async function uploadFile(file) {
+        const buffer = await file.arrayBuffer();
+        const url = `${NTFY_BASE}/${NTFY_TOPIC}?filename=${encodeURIComponent(file.name)}`;
+        const response = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": file.type || "application/octet-stream" },
+          body: buffer
+        });
+        const data = await response.json();
+        if (!response.ok || !data.attachment) {
+          throw new Error("upload failed");
+        }
+        return data.attachment.url;
+      }
+
+      async function sendMessage() {
         const text = textInput.value.trim();
         if (!text && !selectedFile) return;
 
@@ -790,37 +789,30 @@
           createdAt: new Date().toISOString()
         };
 
-        if (selectedFile) {
-          const reader = new FileReader();
-          reader.onload = () => {
-            message.mediaData = reader.result;
+        sendButton.disabled = true;
+        try {
+          if (selectedFile) {
+            message.mediaUrl = await uploadFile(selectedFile);
             message.mime = selectedFile.type;
             message.type = selectedFile.type.startsWith("video/") ? "video" : "image";
-            publishMessage(message);
-          };
-          reader.onerror = () => showAttachment("文件读取失败");
-          reader.readAsDataURL(selectedFile);
-          return;
-        }
+            try {
+              message.mediaData = await fileToDataUrl(selectedFile);
+            } catch {}
+          }
 
-        publishMessage(message);
-      }
-
-      function publishMessage(message) {
-        if (!mqttConnected || !mqttClient) {
-          showAttachment("未连接，发送失败");
-          setStatus(false);
-          return;
-        }
-        try {
-          mqttClient.publish(MQTT_TOPIC, JSON.stringify({ type: "message", message }), { qos: 0 });
+          const outgoing = { ...message };
+          delete outgoing.mediaData;
+          await publishPayload({ type: "message", message: outgoing });
+          serverIds.add(message.id);
           mergeMessages([message]);
           textInput.value = "";
           clearAttachment();
           setStatus(true);
         } catch {
-          showAttachment("发送失败");
+          showAttachment("发送失败，请检查网络");
           setStatus(false);
+        } finally {
+          sendButton.disabled = false;
         }
       }
 
@@ -851,11 +843,11 @@
         .then((saved) => {
           if (Array.isArray(saved)) mergeMessages(saved, false);
           importLegacyHistory();
-          connectMqtt();
+          connectNtfy();
         })
         .catch(() => {
           importLegacyHistory();
-          connectMqtt();
+          connectNtfy();
         });
     })();
   </script>

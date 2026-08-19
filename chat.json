@@ -7,6 +7,16 @@
       "text": "test-sync-1787102767959",
       "type": "text",
       "createdAt": "2026-08-19T01:26:07.994Z"
+    },
+    {
+      "id": "0bd71364-5d5c-4dea-a648-c1312e4c012a",
+      "side": "A",
+      "from": "pky",
+      "text": "media test",
+      "type": "image",
+      "createdAt": "2026-08-19T01:26:42.291Z",
+      "mediaUrl": "https://raw.githubusercontent.com/pkynb/pwchat/main/uploads/0bd71364-5d5c-4dea-a648-c1312e4c012a.png",
+      "mime": "image/png"
     }
   ]
 }

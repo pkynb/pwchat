@@ -130,6 +130,43 @@
       background: #f0fdfa;
     }
     .start-option small { color: #64748b; }
+    .sync-settings {
+      margin-top: 18px;
+      padding-top: 14px;
+      border-top: 1px solid #e5e7eb;
+    }
+    .sync-settings label {
+      display: block;
+      margin-bottom: 6px;
+      font-size: 13px;
+      color: #374151;
+    }
+    .sync-row {
+      display: flex;
+      gap: 8px;
+    }
+    .sync-row input {
+      flex: 1;
+      min-width: 0;
+      padding: 9px 10px;
+      border: 1px solid #cbd2d9;
+      border-radius: 6px;
+      outline: 0;
+    }
+    .sync-row button {
+      padding: 0 14px;
+      border: 1px solid #cbd2d9;
+      border-radius: 6px;
+      background: #fff;
+      color: #374151;
+      cursor: pointer;
+    }
+    .sync-status {
+      margin-top: 6px;
+      min-height: 18px;
+      font-size: 12px;
+      color: #047857;
+    }
     .quiz-question { margin-bottom: 18px; }
     .quiz-question p { margin: 0 0 8px; }
     .quiz-inputs {
@@ -282,6 +319,14 @@
         <button class="start-option" type="button" id="startPky"><span>pky</span><small>用户 A</small></button>
         <button class="start-option" type="button" id="startWzy"><span>wzy</span><small>用户 B</small></button>
       </div>
+      <div class="sync-settings">
+        <label for="githubTokenInput">GitHub 同步令牌</label>
+        <div class="sync-row">
+          <input id="githubTokenInput" type="password" autocomplete="off" placeholder="ghp_...">
+          <button id="saveGitHubToken" type="button">保存</button>
+        </div>
+        <div id="syncTokenStatus" class="sync-status"></div>
+      </div>
     </div>
     <div id="quizPanel" class="start-panel" hidden>
       <h1>回答问题</h1>
@@ -331,6 +376,10 @@
       const MAX_FILE_BYTES = 30 * 1024 * 1024;
       const NTFY_BASE = "https://ntfy.sh";
       const NTFY_TOPIC = "pwchat-github-pkynb";
+      const GITHUB_REPO = "pkynb/pwchat";
+      const GITHUB_BRANCH = "main";
+      const GITHUB_CHAT_FILE = "chat.json";
+      const GITHUB_TOKEN_KEY = "twoPersonChatGitHubToken";
 
       // 题目和答案集中在这里，改这一块即可。
       const QUESTIONS = [
@@ -678,6 +727,152 @@
         return response.json();
       }
 
+      function getGitHubToken() {
+        try {
+          return localStorage.getItem(GITHUB_TOKEN_KEY) || "";
+        } catch {
+          return "";
+        }
+      }
+
+      function setGitHubToken(token) {
+        localStorage.setItem(GITHUB_TOKEN_KEY, token);
+      }
+
+      function rememberServerMessages(list) {
+        for (const message of list || []) {
+          if (message && message.id) serverIds.add(message.id);
+        }
+      }
+
+      function githubHeaders() {
+        return {
+          Authorization: `Bearer ${getGitHubToken()}`,
+          Accept: "application/vnd.github+json"
+        };
+      }
+
+      async function loadGitHubHistory() {
+        try {
+          const response = await fetch(`https://raw.githubusercontent.com/${GITHUB_REPO}/${GITHUB_BRANCH}/${GITHUB_CHAT_FILE}`, { cache: "no-store" });
+          if (!response.ok) return;
+          const data = await response.json();
+          const list = Array.isArray(data) ? data : (data.messages || []);
+          rememberServerMessages(list);
+          mergeMessages(list);
+        } catch {}
+      }
+
+      function decodeBase64(value) {
+        const binary = atob(value.replace(/\s+/g, ""));
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+        return new TextDecoder().decode(bytes);
+      }
+
+      function encodeBase64(value) {
+        const bytes = new TextEncoder().encode(value);
+        let binary = "";
+        for (const byte of bytes) binary += String.fromCharCode(byte);
+        return btoa(binary);
+      }
+
+      async function fetchGitHubChat() {
+        const response = await fetch(`https://api.github.com/repos/${GITHUB_REPO}/contents/${GITHUB_CHAT_FILE}`, {
+          headers: githubHeaders()
+        });
+        if (response.status === 404) {
+          return { messages: [], sha: null };
+        }
+        if (!response.ok) {
+          throw new Error("read chat failed");
+        }
+        const data = await response.json();
+        let parsed;
+        try {
+          parsed = JSON.parse(decodeBase64(data.content));
+        } catch {
+          parsed = [];
+        }
+        const messages = Array.isArray(parsed) ? parsed : (parsed.messages || []);
+        return { messages, sha: data.sha };
+      }
+
+      async function writeGitHubChat(messages, sha) {
+        const body = {
+          message: "sync chat",
+          content: encodeBase64(JSON.stringify({ messages }, null, 2)),
+          branch: GITHUB_BRANCH
+        };
+        if (sha) body.sha = sha;
+        const response = await fetch(`https://api.github.com/repos/${GITHUB_REPO}/contents/${GITHUB_CHAT_FILE}`, {
+          method: "PUT",
+          headers: githubHeaders(),
+          body: JSON.stringify(body)
+        });
+        if (!response.ok) {
+          throw new Error("write chat failed");
+        }
+        return response.json();
+      }
+
+      async function saveMessageToGitHub(message) {
+        const outgoing = { ...message };
+        delete outgoing.mediaData;
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+          try {
+            const current = await fetchGitHubChat();
+            if (current.messages.some((item) => item.id === outgoing.id)) return;
+            current.messages.push(outgoing);
+            await writeGitHubChat(current.messages, current.sha);
+            rememberServerMessages([outgoing]);
+            return;
+          } catch (error) {
+            if (attempt === 2) throw error;
+          }
+        }
+      }
+
+      function extensionForMime(mime) {
+        const map = {
+          "image/png": ".png",
+          "image/jpeg": ".jpg",
+          "image/gif": ".gif",
+          "image/webp": ".webp",
+          "video/mp4": ".mp4",
+          "video/webm": ".webm",
+          "video/quicktime": ".mov",
+          "video/x-m4v": ".m4v"
+        };
+        if (map[mime]) return map[mime];
+        const fallback = mime.split("/")[1] || "bin";
+        return `.${fallback.replace(/[^a-z0-9]/gi, "") || "bin"}`;
+      }
+
+      async function uploadMediaToGitHub(file, id) {
+        const ext = extensionForMime(file.type);
+        const filename = `${id}${ext}`;
+        const path = `uploads/${filename}`;
+        const bytes = new Uint8Array(await file.arrayBuffer());
+        let binary = "";
+        for (const byte of bytes) binary += String.fromCharCode(byte);
+        const body = {
+          message: "upload media",
+          content: btoa(binary),
+          branch: GITHUB_BRANCH
+        };
+        const encodedPath = path.split("/").map((part) => encodeURIComponent(part)).join("/");
+        const response = await fetch(`https://api.github.com/repos/${GITHUB_REPO}/contents/${encodedPath}`, {
+          method: "PUT",
+          headers: githubHeaders(),
+          body: JSON.stringify(body)
+        });
+        if (!response.ok) {
+          throw new Error("upload media failed");
+        }
+        return `https://raw.githubusercontent.com/${GITHUB_REPO}/${GITHUB_BRANCH}/uploads/${filename}`;
+      }
+
       function syncLocalHistory() {
         const missing = messages.filter((message) => !serverIds.has(message.id));
         for (const message of missing) {
@@ -761,24 +956,13 @@
         showAttachment(`${kind}：${file.name}（${formatBytes(file.size)}）`);
       }
 
-      async function uploadFile(file) {
-        const buffer = await file.arrayBuffer();
-        const url = `${NTFY_BASE}/${NTFY_TOPIC}?filename=${encodeURIComponent(file.name)}`;
-        const response = await fetch(url, {
-          method: "POST",
-          headers: { "Content-Type": file.type || "application/octet-stream" },
-          body: buffer
-        });
-        const data = await response.json();
-        if (!response.ok || !data.attachment) {
-          throw new Error("upload failed");
-        }
-        return data.attachment.url;
-      }
-
       async function sendMessage() {
         const text = textInput.value.trim();
         if (!text && !selectedFile) return;
+        if (!getGitHubToken()) {
+          showAttachment("请先保存 GitHub 同步令牌");
+          return;
+        }
 
         const message = {
           id: makeMessageId(),
@@ -792,7 +976,7 @@
         sendButton.disabled = true;
         try {
           if (selectedFile) {
-            message.mediaUrl = await uploadFile(selectedFile);
+            message.mediaUrl = await uploadMediaToGitHub(selectedFile, message.id);
             message.mime = selectedFile.type;
             message.type = selectedFile.type.startsWith("video/") ? "video" : "image";
             try {
@@ -802,20 +986,34 @@
 
           const outgoing = { ...message };
           delete outgoing.mediaData;
-          await publishPayload({ type: "message", message: outgoing });
+          await saveMessageToGitHub(message);
           serverIds.add(message.id);
           mergeMessages([message]);
+          try {
+            await publishPayload({ type: "message", message: outgoing });
+            setStatus(true);
+          } catch {
+            setStatus(false);
+          }
           textInput.value = "";
           clearAttachment();
-          setStatus(true);
         } catch {
-          showAttachment("发送失败，请检查网络");
+          showAttachment("保存失败，请检查令牌和网络");
           setStatus(false);
         } finally {
           sendButton.disabled = false;
         }
       }
 
+      $("saveGitHubToken").addEventListener("click", () => {
+        const token = $("githubTokenInput").value.trim();
+        if (!token) {
+          $("syncTokenStatus").textContent = "请输入令牌";
+          return;
+        }
+        setGitHubToken(token);
+        $("syncTokenStatus").textContent = "已保存";
+      });
       $("startPky").addEventListener("click", () => chooseIdentity("A"));
       $("startWzy").addEventListener("click", () => chooseIdentity("B"));
       $("quizForm").addEventListener("submit", submitQuiz);
@@ -839,14 +1037,21 @@
 
       loadSettings();
       prepareIdentityScreen();
+      const savedToken = getGitHubToken();
+      if (savedToken) {
+        $("githubTokenInput").value = savedToken;
+        $("syncTokenStatus").textContent = "已保存";
+      }
       loadLocalMessages()
         .then((saved) => {
           if (Array.isArray(saved)) mergeMessages(saved, false);
           importLegacyHistory();
+          loadGitHubHistory();
           connectNtfy();
         })
         .catch(() => {
           importLegacyHistory();
+          loadGitHubHistory();
           connectNtfy();
         });
     })();

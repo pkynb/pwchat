@@ -319,14 +319,6 @@
         <button class="start-option" type="button" id="startPky"><span>pky</span><small>用户 A</small></button>
         <button class="start-option" type="button" id="startWzy"><span>wzy</span><small>用户 B</small></button>
       </div>
-      <div class="sync-settings">
-        <label for="githubTokenInput">GitHub 同步令牌</label>
-        <div class="sync-row">
-          <input id="githubTokenInput" type="password" autocomplete="off" placeholder="ghp_...">
-          <button id="saveGitHubToken" type="button">保存</button>
-        </div>
-        <div id="syncTokenStatus" class="sync-status"></div>
-      </div>
     </div>
     <div id="quizPanel" class="start-panel" hidden>
       <h1>回答问题</h1>
@@ -366,6 +358,7 @@
     </div>
   </main>
 
+  <script src="paho-mqtt.js"></script>
   <script>
     (function () {
       const $ = (id) => document.getElementById(id);
@@ -373,13 +366,10 @@
       const LEGACY_HISTORY_KEY = "twoPersonChatHistory";
       const DB_NAME = "twoPersonChatDB";
       const DB_VERSION = 1;
-      const MAX_FILE_BYTES = 30 * 1024 * 1024;
-      const NTFY_BASE = "https://ntfy.sh";
-      const NTFY_TOPIC = "pwchat-github-pkynb";
-      const GITHUB_REPO = "pkynb/pwchat";
-      const GITHUB_BRANCH = "main";
-      const GITHUB_CHAT_FILE = "chat.json";
-      const GITHUB_TOKEN_KEY = "twoPersonChatGitHubToken";
+      const MAX_FILE_BYTES = 1024 * 1024;
+      const MQTT_HOST = "broker.hivemq.com";
+      const MQTT_PORT = 8884;
+      const MQTT_TOPIC_PREFIX = "pwchat/pkynb/msg/";
 
       // 题目和答案集中在这里，改这一块即可。
       const QUESTIONS = [
@@ -428,8 +418,8 @@
       let serverIds = new Set();
       let selectedFile = null;
       let dbPromise = null;
-      let ntfySocket = null;
-      let ntfyConnected = false;
+      let mqttClient = null;
+      let mqttConnected = false;
 
       function openDatabase() {
         if (dbPromise) return dbPromise;
@@ -915,6 +905,71 @@
         };
       }
 
+      function mqttTopic(messageId) {
+        return MQTT_TOPIC_PREFIX + messageId;
+      }
+
+      function handleMqttMessage(message) {
+        if (!message.destinationName.startsWith(MQTT_TOPIC_PREFIX)) return;
+        try {
+          const data = JSON.parse(message.payloadString);
+          if (!data || !data.message || !data.message.id) return;
+          serverIds.add(data.message.id);
+          mergeMessages([data.message]);
+        } catch {}
+      }
+
+      function publishMqttMessage(message) {
+        const payload = JSON.stringify({ message });
+        mqttClient.publish(mqttTopic(message.id), payload, 1, true);
+      }
+
+      function syncMqttHistory() {
+        if (!mqttConnected || !mqttClient) return;
+        const missing = messages.filter((message) => !serverIds.has(message.id));
+        for (const message of missing) {
+          const outgoing = { ...message };
+          delete outgoing.mediaData;
+          publishMqttMessage(outgoing);
+          serverIds.add(message.id);
+        }
+      }
+
+      function connectMqtt() {
+        if (!window.Paho || mqttClient) return;
+
+        mqttClient = new Paho.Client(MQTT_HOST, MQTT_PORT, `pwchat-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`);
+        mqttClient.onConnectionLost = () => {
+          mqttConnected = false;
+          setStatus(false);
+          setTimeout(() => {
+            mqttClient = null;
+            connectMqtt();
+          }, 5000);
+        };
+        mqttClient.onMessageArrived = handleMqttMessage;
+        mqttClient.connect({
+          useSSL: true,
+          timeout: 10,
+          keepAliveInterval: 30,
+          cleanSession: true,
+          onSuccess: () => {
+            mqttConnected = true;
+            mqttClient.subscribe(MQTT_TOPIC_PREFIX + "#", { qos: 0 });
+            setStatus(true);
+            setTimeout(syncMqttHistory, 1000);
+          },
+          onFailure: () => {
+            mqttConnected = false;
+            setStatus(false);
+            setTimeout(() => {
+              mqttClient = null;
+              connectMqtt();
+            }, 5000);
+          }
+        });
+      }
+
       function importLegacyHistory() {
         try {
           const legacy = JSON.parse(localStorage.getItem(LEGACY_HISTORY_KEY) || "[]");
@@ -959,8 +1014,9 @@
       async function sendMessage() {
         const text = textInput.value.trim();
         if (!text && !selectedFile) return;
-        if (!getGitHubToken()) {
-          showAttachment("请先保存 GitHub 同步令牌");
+        if (!mqttConnected || !mqttClient) {
+          showAttachment("未连接，请稍后重试");
+          setStatus(false);
           return;
         }
 
@@ -976,44 +1032,25 @@
         sendButton.disabled = true;
         try {
           if (selectedFile) {
-            message.mediaUrl = await uploadMediaToGitHub(selectedFile, message.id);
+            message.mediaData = await fileToDataUrl(selectedFile);
             message.mime = selectedFile.type;
             message.type = selectedFile.type.startsWith("video/") ? "video" : "image";
-            try {
-              message.mediaData = await fileToDataUrl(selectedFile);
-            } catch {}
           }
 
-          const outgoing = { ...message };
-          delete outgoing.mediaData;
-          await saveMessageToGitHub(message);
+          publishMqttMessage(message);
           serverIds.add(message.id);
           mergeMessages([message]);
-          try {
-            await publishPayload({ type: "message", message: outgoing });
-            setStatus(true);
-          } catch {
-            setStatus(false);
-          }
           textInput.value = "";
           clearAttachment();
+          setStatus(true);
         } catch {
-          showAttachment("保存失败，请检查令牌和网络");
+          showAttachment("发送失败，请检查网络");
           setStatus(false);
         } finally {
           sendButton.disabled = false;
         }
       }
 
-      $("saveGitHubToken").addEventListener("click", () => {
-        const token = $("githubTokenInput").value.trim();
-        if (!token) {
-          $("syncTokenStatus").textContent = "请输入令牌";
-          return;
-        }
-        setGitHubToken(token);
-        $("syncTokenStatus").textContent = "已保存";
-      });
       $("startPky").addEventListener("click", () => chooseIdentity("A"));
       $("startWzy").addEventListener("click", () => chooseIdentity("B"));
       $("quizForm").addEventListener("submit", submitQuiz);
@@ -1037,28 +1074,15 @@
 
       loadSettings();
       prepareIdentityScreen();
-      const savedToken = getGitHubToken();
-      const urlToken = new URLSearchParams(location.search).get("token");
-      if (urlToken && urlToken.trim()) {
-        setGitHubToken(urlToken.trim());
-        $("githubTokenInput").value = urlToken.trim();
-        $("syncTokenStatus").textContent = "已自动保存";
-        history.replaceState(null, "", location.pathname);
-      } else if (savedToken) {
-        $("githubTokenInput").value = savedToken;
-        $("syncTokenStatus").textContent = "已保存";
-      }
       loadLocalMessages()
         .then((saved) => {
           if (Array.isArray(saved)) mergeMessages(saved, false);
           importLegacyHistory();
-          loadGitHubHistory();
-          connectNtfy();
+          connectMqtt();
         })
         .catch(() => {
           importLegacyHistory();
-          loadGitHubHistory();
-          connectNtfy();
+          connectMqtt();
         });
     })();
   </script>

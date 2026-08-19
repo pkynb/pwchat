@@ -1038,7 +1038,13 @@
       loadSettings();
       prepareIdentityScreen();
       const savedToken = getGitHubToken();
-      if (savedToken) {
+      const urlToken = new URLSearchParams(location.search).get("token");
+      if (urlToken && urlToken.trim()) {
+        setGitHubToken(urlToken.trim());
+        $("githubTokenInput").value = urlToken.trim();
+        $("syncTokenStatus").textContent = "已自动保存";
+        history.replaceState(null, "", location.pathname);
+      } else if (savedToken) {
         $("githubTokenInput").value = savedToken;
         $("syncTokenStatus").textContent = "已保存";
       }
